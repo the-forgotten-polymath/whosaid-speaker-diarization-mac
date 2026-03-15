@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""
+workspace.py: meeting-workspace layer for whosaid (GitHub issues #2, #3).
+
+Turns loose transcription outputs into a dated, auditable meeting workspace:
+
+  meetings/2026-09-16-0703/meeting.m4a
+  meetings/2026-09-16-0703/meeting.txt            plain transcript
+  meetings/2026-09-16-0703/meeting.speakers.txt   speaker-labeled transcript
+  meetings/2026-09-16-0703/action-items.md        per-meeting action items
+
+Meeting folders are YYYY-MM-DD-HHMM, optionally with a numeric collision
+suffix the ingest appends when the plain dated folder already holds a
+different recording: 2026-09-16-0703-2, -3, ... Both shapes are first-class
+dated folders for every subcommand below.
+
+Subcommands (the `whosaid` bash CLI shells out to this module via
+`uv run python lib/workspace.py <subcommand> ...`):
+
+  folder-name <audio> [--tz America/Los_Angeles]
+      Dated folder name YYYY-MM-DD-HHMM derived from the recording's own
+      container creation_time (ffprobe format_tags=creation_time, UTC
+      ISO8601), converted to --tz via stdlib zoneinfo; falls back to the
+      file's mtime. Prints just the folder name to stdout.
+
+  hash <audio>
+      sha256 of the file, streamed — the stable identity behind idempotent
+      ingest and the coverage audit.
+
+  action-items --transcript <path.speakers.txt> [--md-out F] [--json-out F] [--hook CMD]
+      Per-meeting action items. Pluggable: --hook (or WHOSAID_ACTION_ITEMS_HOOK)
+      runs as a shell command with the transcript text on stdin plus
+      WHOSAID_TRANSCRIPT_PATH and WHOSAID_SPEAKERS in the environment; its
+      stdout is the markdown, written to --md-out (default: action-items.md
+      alongside the transcript) and mirrored to --json-out if given. With no
+      hook a skeleton is emitted instead. Exits 0 either way — the offline
+      default stays intact.
+
+  rollup <workspace-dir> [--action-items] [-o INDEX.md] [--action-items-out F]
+         [--similarity-threshold F] [--rebuild]
+      The workspace aggregate. Two JSON state files live in the workspace dir:
+        _workspace.json    manifest: one entry per dated meeting folder
+        _action-items.json living deduplicated action-item corpus
+      Rendering: _INDEX.md (one row per meeting — date, duration, transcribed?,
+      diarized?, action-items? — plus a nothing-missing audit and a recurring-
+      topics section) and, with --action-items, _ACTION-ITEMS.md (corpus
+      grouped by owner then status, plus a possible-duplicates review section).
+      Corpus ids are AI-001... and NEVER renumber; folding is append-only
+      unless --rebuild. Items carry an optional free-form type ("leadership
+      ask", "peer ask", ...) rendered in parens after the status. Dedupe is
+      difflib similarity on normalized text >= --similarity-threshold (0.5–1.0,
+      default 0.82, recorded in _action-items.json as similarity_threshold);
+      pairs within 0.10 below the threshold are listed under
+      "## Possible duplicates (review)" — informational only, never auto-merged.
+      _ACTION-ITEMS.md is living: on every non-rebuild run its hand edits are
+      folded back into the corpus before extraction — hand-edited statuses,
+      types, and titles win over the hook output, "(merged AI-NNN[, ...])"
+      annotations fold the merged-away item's occurrences into the survivor
+      (the merged item stays, never renumbered, status "merged", rendered
+      collapsed as "[merged → AI-XXX]"), and new occurrences keep appending.
+      Only edits visible in the md apply — direct JSON edits also survive.
+      Incremental by default: re-running with nothing new writes nothing.
+
+Everything stays LOCAL: stdlib only, no third-party imports, no network.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".opus", ".webm"}
+# Meeting folder names: YYYY-MM-DD-HHMM, or that plus a numeric collision
+# suffix (-2, -3, ...) appended by the bash ingest side when the plain dated
+# folder already holds a different recording.
+DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{4}(?:-\d+)?$")
+# diarize_sherpa.py renders turns as "[HH:MM:SS] Name: text"; the looser
+# "Name (MM:SS): text" spelling is accepted too so hand-made notes still parse.
+TURN_BRACKET_RE = re.compile(r"^\[\d{1,3}:\d{2}(?::\d{2})?\]\s+([^\n:]+?):\s")
+TURN_PAREN_RE = re.compile(r"^([A-Za-z][\w .'/-]*?)\s*\(\d{1,3}:\d{2}(?::\d{2})?\):\s")
+SPEAKERS_HEADER_RE = re.compile(r"^#\s+Speakers?\s*\(\d+\)\s*:\s*(.+)$", re.IGNORECASE)
+BULLET_RE = re.compile(
+    r"^\s*[-*]\s+(?:[-x]\s+)?(?:\*\*(?P<owner>[^*]+?)\s*:?\*\*\s*:?\s+)?(?P<text>\S.*)$"
+)
+SIMILARITY_THRESHOLD = 0.82
+# Pairs scoring within this band below the threshold are surfaced (never
+# merged) under "## Possible duplicates (review)".
+NEAR_MISS_BAND = 0.10
+STATUSES = ("open", "ongoing", "resolved")
+# Rendered _ACTION-ITEMS.md item lines: "- **AI-001** [status] (type) span
+# (n×): text", optionally carrying "(merged AI-NNN, ...)" hand-merge notes
+# (before the ": " or trailing the text) and the collapsed merged rendering
+# "- **AI-005** [merged → AI-002] (n×): text".
+MD_ITEM_RE = re.compile(r"^- \*\*(?P<id>AI-\d{3,})\*\* \[(?P<status>[^\]]*)\](?P<rest>.*)$")
+MD_MERGE_NOTE_RE = re.compile(r"\((?P<ids>merged AI-\d{3,}(?:, ?AI-\d{3,})*)\)")
+MD_MERGED_STATUS_RE = re.compile(r"^merged → (AI-\d{3,})$")
+MD_COUNT_RE = re.compile(r"^\d+×$")
+MD_PAREN_RE = re.compile(r"\(([^()]*)\)")
+
+STOPWORDS = frozenset(
+    """
+    a about above after again all also am an and any are aren't as at be because
+    been before being below between both but by can can't cannot could couldn't
+    did didn't do does doesn't doing don't down during each few for from further
+    had hadn't has hasn't have haven't having he he'd he'll he's her here here's
+    hers herself him himself his how how's i i'd i'll i'm i've if in into is
+    isn't it it's its itself just let's me more most mustn't my myself no nor
+    not of off on once only or other ought our ours ourselves out over own same
+    shan't she she'd she'll she's should shouldn't so some such than that that's
+    the their theirs them themselves then there there's these they they'd
+    they'll they're they've this those through to too under until up very was
+    wasn't we we'd we'll we're we've were weren't what what's when when's where
+    where's which while who who's whom why why's with won't would wouldn't you
+    you'd you'll you're you've your yours yourself yourselves yeah okay ok um
+    like know think really going get got go going one two also us will can
+    kind sort little bit right well maybe thing things want need let lets say
+    said says see look looks course sure mean means anyway actually basically
+    """.split()
+)
+
+
+def log(msg: str) -> None:
+    print(f"whosaid: {msg}", file=sys.stderr)
+
+
+# ---- small shared helpers ------------------------------------------------------
+
+def write_if_changed(path: Path, text: str) -> bool:
+    """Write only when content differs, so re-runs never touch mtimes. Returns True if written."""
+    if path.exists() and path.read_text() == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return True
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_creation_time(raw: str) -> datetime | None:
+    """Container creation_time (UTC ISO8601, 'Z' or offset, space or 'T' separator) -> aware UTC datetime."""
+    s = raw.strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    s = s.replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def probe_creation_time(audio: Path) -> datetime | None:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags=creation_time",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(audio)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return parse_creation_time(out.stdout)
+
+
+def probe_duration_s(audio: Path) -> float | None:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(audio)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return round(float(out.stdout.strip()), 1) if out.returncode == 0 else None
+    except ValueError:
+        return None
+
+
+def hms(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    t = int(round(seconds))
+    return f"{t // 3600}:{(t % 3600) // 60:02d}:{t % 60:02d}"
+
+
+# ---- transcript parsing --------------------------------------------------------
+
+def parse_speakers(transcript_text: str) -> list[str]:
+    """Distinct speaker names, in first-appearance order, from a speaker-labeled
+    transcript ([HH:MM:SS] Name: text turns, 'Name (MM:SS): text' variants, and
+    the '# Speakers (N): ...' header the diarizer writes)."""
+    seen: dict[str, None] = {}
+    for line in transcript_text.splitlines():
+        if line.startswith("#"):
+            m = SPEAKERS_HEADER_RE.match(line)
+            if m:
+                for name in m.group(1).split(","):
+                    name = name.strip()
+                    if name:
+                        seen.setdefault(name, None)
+            continue
+        m = TURN_BRACKET_RE.match(line) or TURN_PAREN_RE.match(line)
+        if m:
+            seen.setdefault(m.group(1).strip(), None)
+    return list(seen)
+
+
+def parse_bullets(markdown: str) -> list[tuple[int, str, str]]:
+    """Action-item bullets -> [(line_no, owner, text)]. '- **Owner:** text' and
+    plain '- text' both parse; owner is '' when absent."""
+    out = []
+    for n, line in enumerate(markdown.splitlines(), start=1):
+        m = BULLET_RE.match(line)
+        if m and m.group("text").strip():
+            out.append((n, (m.group("owner") or "").strip(), m.group("text").strip()))
+    return out
+
+
+def normalize_text(text: str) -> str:
+    lowered = text.lower()
+    stripped = re.sub(r"[^0-9a-z\s]", " ", lowered)
+    return " ".join(stripped.split())
+
+
+def similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def similar(a: str, b: str, threshold: float = SIMILARITY_THRESHOLD) -> bool:
+    return similarity(a, b) >= threshold
+
+
+# ---- folder-name / hash ----------------------------------------------------------
+
+def cmd_folder_name(args: argparse.Namespace) -> int:
+    audio = Path(args.audio)
+    if not audio.is_file():
+        log(f"folder-name: file not found: {audio}")
+        return 1
+    try:
+        tz = ZoneInfo(args.tz)
+    except Exception as e:  # noqa: BLE001
+        log(f"folder-name: unknown timezone {args.tz!r} ({e})")
+        return 1
+    dt = probe_creation_time(audio)
+    if dt is not None:
+        log(f"creation_time={dt.isoformat()} (container tag)")
+    else:
+        dt = datetime.fromtimestamp(audio.stat().st_mtime, tz=timezone.utc)
+        log("creation_time tag missing/empty; falling back to file mtime")
+    local = dt.astimezone(tz)
+    print(local.strftime("%Y-%m-%d-%H%M"))
+    return 0
+
+
+def cmd_hash(args: argparse.Namespace) -> int:
+    audio = Path(args.audio)
+    if not audio.is_file():
+        log(f"hash: file not found: {audio}")
+        return 1
+    print(sha256_file(audio))
+    return 0
+
+
+# ---- action-items ----------------------------------------------------------------
+
+def skeleton_markdown(transcript: Path, speakers: list[str]) -> str:
+    lines = [
+        f"# Action items — {transcript.parent.name}",
+        "",
+        "_No summarizer hook is configured, so no action items were extracted._",
+        "_Pass --hook CMD (or set WHOSAID_ACTION_ITEMS_HOOK) to generate them offline._",
+        "",
+    ]
+    if speakers:
+        lines.append(f"Speakers in this meeting: {', '.join(speakers)}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_action_items(args: argparse.Namespace) -> int:
+    transcript = Path(args.transcript)
+    if not transcript.is_file():
+        log(f"action-items: transcript not found: {transcript}")
+        return 1
+    text = transcript.read_text()
+    speakers = parse_speakers(text)
+
+    hook = args.hook or os.environ.get("WHOSAID_ACTION_ITEMS_HOOK", "")
+    source = "skeleton"
+    markdown = ""
+    if hook:
+        env = dict(os.environ)
+        env["WHOSAID_TRANSCRIPT_PATH"] = str(transcript.resolve())
+        env["WHOSAID_SPEAKERS"] = ",".join(speakers)
+        try:
+            proc = subprocess.run(
+                hook, shell=True, input=text, env=env,
+                capture_output=True, text=True,
+            )
+        except OSError as e:  # noqa: BLE001
+            log(f"WARN action-items hook failed to start ({e}); writing skeleton")
+            proc = None
+        if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+            source = "hook"
+            markdown = proc.stdout
+        elif proc is not None:
+            tail = (proc.stderr or "").strip().splitlines()[-1:] or ["(no stderr)"]
+            log(f"WARN action-items hook exited {proc.returncode}: {tail[0]}; writing skeleton")
+    if source == "skeleton":
+        markdown = skeleton_markdown(transcript, speakers)
+
+    md_out = Path(args.md_out) if args.md_out else transcript.parent / "action-items.md"
+    wrote = write_if_changed(md_out, markdown if markdown.endswith("\n") else markdown + "\n")
+    log(f"action items ({source}) -> {md_out}" + (" (unchanged)" if not wrote else ""))
+
+    if args.json_out:
+        payload = {
+            "transcript": str(transcript),
+            "md_out": str(md_out),
+            "source": source,
+            "speakers": speakers,
+            "items": [{"line": n, "owner": o, "text": t} for n, o, t in parse_bullets(markdown)],
+        }
+        write_if_changed(Path(args.json_out), json.dumps(payload, indent=2) + "\n")
+    return 0
+
+
+# ---- rollup: manifest -------------------------------------------------------------
+
+@dataclass
+class Meeting:
+    folder: str
+    source_name: str | None = None
+    source_sha256: str | None = None
+    created: str | None = None
+    duration_s: float | None = None
+    has_txt: bool = False
+    has_json: bool = False
+    has_speakers: bool = False
+    has_action_items: bool = False
+    ingested_at: str = ""
+
+
+def find_source_audio(folder: Path) -> Path | None:
+    candidates = sorted(
+        (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS),
+        key=lambda p: (-p.stat().st_size, p.name),
+    )
+    return candidates[0] if candidates else None
+
+
+def scan_meeting(folder: Path, previous: Meeting | None) -> Meeting:
+    prev = previous or Meeting(folder=folder.name)
+    m = Meeting(folder=folder.name, ingested_at=prev.ingested_at)
+    audio = find_source_audio(folder)
+    if audio:
+        m.source_name = audio.name
+        m.source_sha256 = sha256_file(audio)
+        dur = probe_duration_s(audio)
+        if dur is not None:
+            m.duration_s = dur
+    created = probe_creation_time(audio) if audio else None
+    if created is None:
+        m.created = folder.name
+    else:
+        m.created = created.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not m.ingested_at:
+        m.ingested_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    files = [p.name for p in folder.iterdir() if p.is_file()]
+    m.has_txt = any(
+        n.endswith(".txt") and not n.endswith((".speakers.txt", ".speaker-cards.txt"))
+        for n in files
+    )
+    m.has_json = any(n.endswith(".json") for n in files)
+    m.has_speakers = any(n.endswith(".speakers.txt") for n in files)
+    m.has_action_items = any(n == "action-items.md" for n in files)
+    return m
+
+
+def load_manifest(ws: Path) -> dict:
+    try:
+        data = json.loads((ws / "_workspace.json").read_text())
+        if isinstance(data, dict) and isinstance(data.get("meetings"), list):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        log(f"WARN _workspace.json unreadable ({e}); starting a fresh manifest")
+    return {"meetings": []}
+
+
+def manifest_to_meetings(data: dict) -> dict[str, Meeting]:
+    out = {}
+    for entry in data.get("meetings", []):
+        try:
+            m = Meeting(**entry)
+        except TypeError:
+            continue
+        out[m.folder] = m
+    return out
+
+
+# ---- rollup: recurring topics -------------------------------------------------------
+
+def tokenize_line(line: str) -> list[str]:
+    line = TURN_BRACKET_RE.sub(" ", line)
+    words = re.sub(r"[^0-9A-Za-z\s]", " ", line.lower()).split()
+    return [w for w in words if w.isalpha() and len(w) >= 3 and w not in STOPWORDS]
+
+
+def recurring_topics(speakers_texts: dict[str, str]) -> list[tuple[str, int, int]]:
+    """Top unigrams/bigrams appearing in >= 2 meetings: [(term, total, meetings)], best first."""
+    counts: dict[str, int] = {}
+    docs: dict[str, set[str]] = {}
+    for meeting, text in speakers_texts.items():
+        seen_here: set[str] = set()
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            toks = tokenize_line(line)
+            terms = toks + [f"{a} {b}" for a, b in zip(toks, toks[1:])]
+            for term in terms:
+                counts[term] = counts.get(term, 0) + 1
+                seen_here.add(term)
+        for term in seen_here:
+            docs.setdefault(term, set()).add(meeting)
+    scored = [(t, c, len(docs[t])) for t, c in counts.items() if len(docs[t]) >= 2]
+    scored.sort(key=lambda x: (-x[1], -x[2], x[0]))
+    return scored[:16]
+
+
+def render_index(ws: Path, meetings: list[Meeting], orphans: list[str], stale: list[str],
+                 topics: list[tuple[str, int, int]]) -> str:
+    lines = [f"# Meeting workspace index — {ws.resolve()}", "",
+             f"{len(meetings)} meeting(s).", "", "## Meetings", "",
+             "| Meeting | Created | Duration | Transcribed | Diarized | Action items |",
+             "|---|---|---|---|---|---|"]
+    for m in meetings:
+        lines.append(
+            f"| {m.folder} | {m.created or '—'} | {hms(m.duration_s)} | "
+            f"{'yes' if m.has_txt else 'NO'} | {'yes' if m.has_speakers else 'NO'} | "
+            f"{'yes' if m.has_action_items else '—'} |"
+        )
+    lines += ["", "## Audit", ""]
+    problems = 0
+    for m in meetings:
+        missing = [name for name, ok in (
+            ("transcript .txt", m.has_txt), ("speakers .speakers.txt", m.has_speakers),
+            ("action-items.md", m.has_action_items),
+        ) if not ok]
+        if m.source_sha256:
+            lines.append(
+                f"- {m.folder}: source={m.source_name} sha256={m.source_sha256[:16]}…"
+                + (f"  MISSING: {', '.join(missing)}" if missing else "  ok")
+            )
+        else:
+            lines.append(f"- {m.folder}: NO SOURCE AUDIO in folder" +
+                         (f"; also missing {', '.join(missing)}" if missing else ""))
+        problems += bool(missing) + (0 if m.source_sha256 else 1)
+    for folder in orphans:
+        lines.append(f"- ORPHAN {folder}/: present in workspace but not a dated meeting folder "
+                     "(YYYY-MM-DD-HHMM[-N]); ignored by the manifest")
+        problems += 1
+    for folder in stale:
+        lines.append(f"- STALE {folder}/: in manifest but folder no longer exists (run with --rebuild to drop)")
+        problems += 1
+    if problems == 0:
+        lines.append("- nothing missing: every dated folder has a manifest entry, source, "
+                     "transcript, speaker labels, and action items.")
+    lines += ["", "## Recurring topics", ""]
+    if topics:
+        lines.append("_Terms appearing in the speaker-labeled transcripts of ≥2 meetings._")
+        lines.append("")
+        for term, total, nmeet in topics:
+            lines.append(f"- **{term}** — {total}× across {nmeet} meetings")
+    else:
+        lines.append("_No term recurs across ≥2 meetings yet (needs diarized transcripts)._")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---- rollup: action-item corpus ------------------------------------------------------
+
+@dataclass
+class Occurrence:
+    meeting: str
+    line: int
+
+
+@dataclass
+class ActionItem:
+    id: str
+    text: str
+    owner: str = ""
+    status: str = "open"
+    type: str = ""
+    first_seen: str = ""
+    last_seen: str = ""
+    merged_into: str = ""
+    md_status: str = ""
+    md_text: str = ""
+    md_type: str = ""
+    occurrences: list[Occurrence] = field(default_factory=list)
+
+
+def load_corpus(ws: Path) -> dict:
+    try:
+        data = json.loads((ws / "_action-items.json").read_text())
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            data.setdefault("next_id", 1)
+            data.setdefault("folded_meetings", [])
+            for item in data["items"]:
+                item["occurrences"] = [Occurrence(**o) for o in item.get("occurrences", [])]
+                item.setdefault("status", "open")
+                for key in ("type", "merged_into", "md_status", "md_text", "md_type"):
+                    item.setdefault(key, "")
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        log(f"WARN _action-items.json unreadable ({e}); starting a fresh corpus")
+    return {"next_id": 1, "folded_meetings": [], "items": []}
+
+
+def corpus_to_items(data: dict) -> list[ActionItem]:
+    return [ActionItem(**item) for item in data.get("items", [])]
+
+
+def parse_action_items_md(md_text: str) -> dict[str, dict]:
+    """Rendered _ACTION-ITEMS.md item lines -> {id: {status, type, text,
+    merged_into, merged_ids}}. Count/span parens are skipped; hand-merge
+    notes '(merged AI-NNN, ...)' are honored both before the ': ' and
+    trailing the item text."""
+    out: dict[str, dict] = {}
+    for line in md_text.splitlines():
+        m = MD_ITEM_RE.match(line)
+        if not m:
+            continue
+        meta, _, text = m.group("rest").partition(": ")
+        merged_ids: list[str] = []
+        note = MD_MERGE_NOTE_RE.search(text)
+        if note and not text[note.end():].strip():
+            merged_ids = re.findall(r"AI-\d{3,}", note.group("ids"))
+            text = text[:note.start()].rstrip()
+        item_type = ""
+        for group in MD_PAREN_RE.findall(meta):
+            if MD_COUNT_RE.match(group):
+                continue
+            if MD_MERGE_NOTE_RE.fullmatch(f"({group})"):
+                merged_ids = re.findall(r"AI-\d{3,}", group) + merged_ids
+                continue
+            item_type = group
+        status = m.group("status")
+        merged_into = ""
+        ms = MD_MERGED_STATUS_RE.match(status)
+        if ms:
+            status, merged_into = "merged", ms.group(1)
+        out[m.group("id")] = {"status": status, "type": item_type, "text": text,
+                              "merged_into": merged_into, "merged_ids": merged_ids}
+    return out
+
+
+def reconcile_from_md(items: list[ActionItem], md_text: str) -> None:
+    """Fold hand edits from the rendered _ACTION-ITEMS.md back onto the corpus:
+    statuses, types, retitles, and '(merged AI-NNN)' merge notes win over the
+    extracted fields. Each curated field is applied only when it changed in
+    the md since the last render (item.md_*), so direct JSON edits — and the
+    collapsed '[merged → AI-XXX]' re-render — reconcile to no-ops."""
+    parsed = parse_action_items_md(md_text)
+    by_id = {it.id: it for it in items}
+
+    def merge_into(survivor: ActionItem | None, merged_id: str) -> None:
+        merged = by_id.get(merged_id)
+        if merged is None:
+            log(f"WARN _ACTION-ITEMS.md names unknown id {merged_id}; ignored")
+            return
+        if survivor is None or merged is survivor:
+            return
+        if merged.status == "merged":
+            if merged.merged_into != survivor.id:
+                log(f"WARN {merged_id} already merged into {merged.merged_into}; "
+                    f"not re-merging into {survivor.id}")
+            return
+        have = {(o.meeting, o.line) for o in survivor.occurrences}
+        survivor.occurrences += [o for o in merged.occurrences if (o.meeting, o.line) not in have]
+        survivor.first_seen = min(survivor.first_seen, merged.first_seen)
+        survivor.last_seen = max(survivor.last_seen, merged.last_seen)
+        merged.status, merged.merged_into = "merged", survivor.id
+        log(f"  ~ {merged_id} merged into {survivor.id} (hand edit)")
+
+    for line_id in sorted(parsed):
+        entry = parsed[line_id]
+        it = by_id.get(line_id)
+        if it is None:
+            log(f"WARN _ACTION-ITEMS.md lists unknown id {line_id}; ignored")
+            continue
+        for merged_id in entry["merged_ids"]:
+            merge_into(it, merged_id)
+        if entry["merged_into"]:
+            merge_into(by_id.get(entry["merged_into"]), line_id)
+
+    for it in items:
+        entry = parsed.get(it.id)
+        if entry is None:
+            log(f"NOTE {it.id} absent from _ACTION-ITEMS.md; kept")
+            continue
+        if it.status != "merged" and entry["status"] and entry["status"] != it.status \
+                and entry["status"] != it.md_status:
+            log(f"  ~ {it.id} status {it.status!r} -> {entry['status']!r} (hand edit)")
+            it.status = entry["status"]
+        if entry["text"] and entry["text"] != it.text and entry["text"] != it.md_text:
+            log(f"  ~ {it.id} retitled (hand edit): {entry['text']}")
+            it.text = entry["text"]
+        if it.status != "merged" and entry["type"] != it.type and entry["type"] != it.md_type:
+            log(f"  ~ {it.id} type -> {entry['type']!r} (hand edit)")
+            it.type = entry["type"]
+
+
+def fold_meeting(meeting_folder: str, bullets: list[tuple[int, str, str]],
+                 items: list[ActionItem], next_id: list[int],
+                 threshold: float = SIMILARITY_THRESHOLD,
+                 near_misses: list[tuple[str, str, float]] | None = None) -> list[ActionItem]:
+    for line_no, owner, text in bullets:
+        norm = normalize_text(text)
+        if not norm:
+            continue
+        match: ActionItem | None = None
+        best_below: tuple[float, ActionItem] | None = None
+        for it in items:
+            ratio = similarity(norm, normalize_text(it.text))
+            if ratio >= threshold and match is None:
+                match = it
+            elif it.status != "merged" and threshold - NEAR_MISS_BAND <= ratio < threshold:
+                if best_below is None or ratio > best_below[0]:
+                    best_below = (ratio, it)
+        target = match
+        if target is None:
+            item = ActionItem(
+                id=f"AI-{next_id[0]:03d}", text=text, owner=owner,
+                first_seen=meeting_folder, last_seen=meeting_folder,
+                occurrences=[Occurrence(meeting=meeting_folder, line=line_no)],
+            )
+            next_id[0] += 1
+            items.append(item)
+            target = item
+            log(f"  + {item.id} (new): {text}")
+        else:
+            if not target.owner and owner:
+                target.owner = owner
+            target.last_seen = max(target.last_seen, meeting_folder)
+            if not any(o.meeting == meeting_folder for o in target.occurrences):
+                target.occurrences.append(Occurrence(meeting=meeting_folder, line=line_no))
+            log(f"  = {target.id} (dedup, {len(target.occurrences)}×): {text}")
+        if best_below is not None and near_misses is not None:
+            near_misses.append((target.id, best_below[1].id, best_below[0]))
+    return items
+
+
+def possible_duplicates(items: list[ActionItem],
+                        near_misses: list[tuple[str, str, float]],
+                        threshold: float) -> list[tuple[str, str, float]]:
+    """Distinct corpus-item pairs scoring in [threshold - 0.10, threshold),
+    deduped by id pair, most similar first. Merged items are skipped."""
+    best: dict[tuple[str, str], float] = {}
+
+    def add(id_a: str, id_b: str, ratio: float) -> None:
+        key = tuple(sorted((id_a, id_b)))
+        best[key] = max(best.get(key, 0.0), ratio)
+
+    for id_a, id_b, ratio in near_misses:
+        add(id_a, id_b, ratio)
+    live = [it for it in items if it.status != "merged"]
+    norms = [normalize_text(it.text) for it in live]
+    for i in range(len(live)):
+        for j in range(i + 1, len(live)):
+            ratio = similarity(norms[i], norms[j])
+            if threshold - NEAR_MISS_BAND <= ratio < threshold:
+                add(live[i].id, live[j].id, ratio)
+    return sorted(((a, b, r) for (a, b), r in best.items()),
+                  key=lambda x: (-x[2], x[0], x[1]))
+
+
+def render_action_items_md(ws: Path, items: list[ActionItem],
+                           dupes: list[tuple[str, str, float]] | None = None) -> str:
+    lines = [f"# Action items — {ws.resolve()}", "",
+             "Living corpus, deduplicated across meetings. Ids are stable and never "
+             "renumber; hand edits (status, type, retitle, merges) survive re-runs. "
+             "Grouped by owner, then status.", ""]
+    if not items:
+        lines += ["_No action items yet._", ""]
+        return "\n".join(lines)
+    groups: dict[str, dict[str, list[ActionItem]]] = {}
+    for it in items:
+        groups.setdefault(it.owner or "(unassigned)", {}).setdefault(it.status, []).append(it)
+    for owner in sorted(groups):
+        lines.append(f"## {owner}")
+        lines.append("")
+        for status in STATUSES + tuple(s for s in groups[owner] if s not in STATUSES):
+            bucket = groups[owner].get(status)
+            if not bucket:
+                continue
+            lines.append(f"### {status}")
+            lines.append("")
+            for it in bucket:
+                if it.status == "merged":
+                    lines.append(f"- **{it.id}** [merged → {it.merged_into}] "
+                                 f"({len(it.occurrences)}×): {it.text}")
+                else:
+                    span = it.first_seen if it.first_seen == it.last_seen else f"{it.first_seen} → {it.last_seen}"
+                    type_part = f" ({it.type})" if it.type else ""
+                    lines.append(f"- **{it.id}** [{it.status}]{type_part} {span} "
+                                 f"({len(it.occurrences)}×): {it.text}")
+            lines.append("")
+    if dupes:
+        texts = {it.id: it.text for it in items}
+        lines += ["## Possible duplicates (review)", "",
+                  "_Pairs scoring within 0.10 below the similarity threshold — "
+                  "merge by hand if truly alike._", ""]
+        for a, b, ratio in dupes:
+            lines.append(f"- {a} ↔ {b} ({ratio:.2f}): \"{texts[b]}\"")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_rollup(args: argparse.Namespace) -> int:
+    if not 0.5 <= args.similarity_threshold <= 1.0:
+        log(f"rollup: --similarity-threshold must be between 0.5 and 1.0 "
+            f"(got {args.similarity_threshold})")
+        return 1
+    ws = Path(args.workspace_dir)
+    if not ws.is_dir():
+        log(f"rollup: workspace dir not found: {ws}")
+        return 1
+
+    if args.rebuild:
+        log("--rebuild: resetting manifest + corpus and rebuilding from folders")
+        manifest_data = {"meetings": []}
+        corpus_data = {"next_id": 1, "folded_meetings": [], "items": []}
+    else:
+        manifest_data = load_manifest(ws)
+        corpus_data = load_corpus(ws)
+
+    prev_meetings = manifest_to_meetings(manifest_data)
+    dated: list[Path] = []
+    orphans: list[str] = []
+    for entry in sorted(ws.iterdir()):
+        if entry.name.startswith(("_", ".")):
+            continue
+        if entry.is_dir() and DATE_DIR_RE.match(entry.name):
+            dated.append(entry)
+        elif entry.is_dir():
+            orphans.append(entry.name)
+    stale = [f for f in prev_meetings if f not in {p.name for p in dated}]
+
+    meetings = [scan_meeting(folder, prev_meetings.get(folder.name)) for folder in dated]
+    manifest_data = {
+        "meetings": [
+            {k: v for k, v in vars(m).items() if v is not None} for m in meetings
+        ]
+    }
+
+    items = corpus_to_items(corpus_data)
+    next_id = [int(corpus_data.get("next_id", 1))]
+    folded: set[str] = set(corpus_data.get("folded_meetings", []))
+    ai_out = Path(args.action_items_out) if args.action_items_out else ws / "_ACTION-ITEMS.md"
+
+    if not args.rebuild and ai_out.is_file():
+        log(f"reconciling hand edits from {ai_out.name}")
+        reconcile_from_md(items, ai_out.read_text())
+
+    near_misses: list[tuple[str, str, float]] = []
+    if args.action_items:
+        for folder in dated:
+            md_path = folder / "action-items.md"
+            if not md_path.is_file():
+                continue
+            if folder.name in folded:
+                log(f"  {folder.name}: action items already folded (skipping)")
+                continue
+            bullets = parse_bullets(md_path.read_text())
+            log(f"folding {folder.name}/action-items.md ({len(bullets)} item(s))")
+            fold_meeting(folder.name, bullets, items, next_id,
+                         args.similarity_threshold, near_misses)
+            folded.add(folder.name)
+    dupes = possible_duplicates(items, near_misses, args.similarity_threshold)
+    ai_md = render_action_items_md(ws, items, dupes)
+    for it in items:
+        it.md_status, it.md_text = it.status, it.text
+        it.md_type = it.type if it.status != "merged" else ""
+    corpus_data = {
+        "next_id": next_id[0],
+        "similarity_threshold": args.similarity_threshold,
+        "folded_meetings": sorted(folded),
+        "items": [
+            {
+                "id": it.id, "text": it.text, "type": it.type, "owner": it.owner,
+                "status": it.status, "first_seen": it.first_seen, "last_seen": it.last_seen,
+                "merged_into": it.merged_into,
+                "occurrences": [vars(o) for o in it.occurrences],
+                "md_status": it.md_status, "md_text": it.md_text, "md_type": it.md_type,
+            }
+            for it in items
+        ],
+    }
+
+    speakers_texts = {
+        m.folder: "\n".join(
+            p.read_text() for p in sorted((ws / m.folder).glob("*.speakers.txt"))
+        )
+        for m in meetings if m.has_speakers
+    }
+    index_md = render_index(ws, meetings, orphans, stale, recurring_topics(speakers_texts))
+
+    index_out = Path(args.out) if args.out else ws / "_INDEX.md"
+    changed = write_if_changed(index_out, index_md)
+    manifest_out = ws / "_workspace.json"
+    changed_manifest = write_if_changed(
+        manifest_out, json.dumps(manifest_data, indent=2) + "\n"
+    )
+    corpus_out = ws / "_action-items.json"
+    if args.action_items or items or (ws / "_action-items.json").exists():
+        changed_corpus = write_if_changed(
+            corpus_out, json.dumps(corpus_data, indent=2) + "\n"
+        )
+        changed_ai = write_if_changed(ai_out, ai_md)
+    else:
+        changed_corpus = changed_ai = False
+
+    log(f"index -> {index_out}" + ("" if changed else " (unchanged)"))
+    log(f"manifest ({len(meetings)} meetings) -> {manifest_out}"
+        + ("" if changed_manifest else " (unchanged)"))
+    if changed_corpus or changed_ai:
+        log(f"corpus ({len(items)} items, next id AI-{next_id[0]:03d}) -> {corpus_out}")
+    elif args.action_items:
+        log(f"corpus unchanged ({len(items)} items)")
+    if stale:
+        log(f"NOTE {len(stale)} stale manifest entr(ies); re-run with --rebuild to drop them")
+    return 0
+
+
+# ---- CLI --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="workspace.py",
+        description="whosaid meeting-workspace layer: dated folders, action items, "
+                    "and the coverage/corpus roll-up (issues #2, #3).",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    pfn = sub.add_parser(
+        "folder-name", help="dated folder name YYYY-MM-DD-HHMM from the recording's "
+                            "own creation_time (mtime fallback)")
+    pfn.add_argument("audio", help="audio file to read the timestamp from")
+    pfn.add_argument("--tz", default="UTC",
+                     help="IANA timezone to render the local time in (default: UTC)")
+    pfn.set_defaults(func=cmd_folder_name)
+
+    ph = sub.add_parser("hash", help="sha256 of an audio file (stable ingest identity)")
+    ph.add_argument("audio")
+    ph.set_defaults(func=cmd_hash)
+
+    pai = sub.add_parser(
+        "action-items", help="per-meeting action items; pluggable hook gets the "
+                             "transcript on stdin and returns markdown")
+    pai.add_argument("--transcript", required=True,
+                     help="speaker-labeled transcript (*.speakers.txt)")
+    pai.add_argument("--md-out", default=None,
+                     help="markdown output path (default: action-items.md next to the transcript)")
+    pai.add_argument("--json-out", default=None, help="also write parsed items as JSON")
+    pai.add_argument("--hook", default=None,
+                     help="shell command producing markdown from stdin "
+                          "(default: $WHOSAID_ACTION_ITEMS_HOOK, else skeleton)")
+    pai.set_defaults(func=cmd_action_items)
+
+    pr = sub.add_parser("rollup", help="aggregate a meeting workspace: coverage index, "
+                                       "audit, recurring topics, action-item corpus")
+    pr.add_argument("workspace_dir", help="workspace directory of dated meeting folders")
+    pr.add_argument("--action-items", action="store_true",
+                    help="fold each meeting's action-items.md into the deduplicated corpus")
+    pr.add_argument("-o", "--out", default=None,
+                    help="index markdown path (default: <workspace>/_INDEX.md)")
+    pr.add_argument("--action-items-out", default=None,
+                    help="corpus markdown path (default: <workspace>/_ACTION-ITEMS.md)")
+    pr.add_argument("--similarity-threshold", type=float, default=SIMILARITY_THRESHOLD,
+                    help="difflib ratio at or above which two items fold together "
+                         "(0.5-1.0, default: %(default)s); pairs within 0.10 below it "
+                         "are listed as possible duplicates")
+    pr.add_argument("--rebuild", action="store_true",
+                    help="reset manifest + corpus and rebuild from folders")
+    pr.set_defaults(func=cmd_rollup)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

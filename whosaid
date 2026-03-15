@@ -1,0 +1,1278 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# whosaid — local, GPU-accelerated, speaker-attributed transcription (Apple Silicon)
+#
+# Usage:
+#   whosaid setup                 Run bootstrap.sh (deps, models, disk check).
+#   whosaid install               Install a stable command in ~/.local/bin.
+#   whosaid enroll [Name]         Record a voice sample and name a speaker cluster.
+#   whosaid record [--label L]    Record from the mic, then transcribe it.
+#   whosaid doctor                Read-only environment/model/device report.
+#   whosaid version | --version   Print the installed version.
+#   whosaid mcp                   Run the MCP server (stdio) for AI agents / Claude.
+#   whosaid <audio> [...]         Transcribe (and, by default, diarize) audio file(s).
+#   whosaid ingest <a...> --into D  Transcribe into a dated meeting workspace.
+#   whosaid roll-up <dir>           Rebuild the meeting-workspace index and audit.
+#   whosaid help                  This message.
+#
+# See `whosaid help` for the full flag reference.
+# ==============================================================================
+set -euo pipefail
+
+# Make Homebrew tools (ffmpeg, uv) visible even under a minimal PATH.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# Follow symlinks so an installed ~/.local/bin/whosaid command still finds the
+# implementation and model helpers in this checkout.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$SOURCE_DIR/$SOURCE"
+done
+REPO_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# Single source of truth for the released version. Bump this alongside the
+# CHANGELOG.md entry and git tag at release time.
+WHOSAID_VERSION="1.1.0"
+
+HELPER="$REPO_DIR/lib/transcribe_mlx.py"
+DIARIZER="$REPO_DIR/lib/diarize_sherpa.py"
+VOICE_REFS="${WHOSAID_VOICE_REFS:-$REPO_DIR/voices}"
+RECORDINGS_DIR="$REPO_DIR/recordings"
+LANG_CODE_DEFAULT="${WHOSAID_LANG:-en}"
+REC_DEVICE="${WHOSAID_REC_DEVICE:-0}"
+
+log() { echo "whosaid: $*" >&2; }
+
+# ---- temp-directory checkout guard --------------------------------------------
+# True (0) when the resolved path is under a system temp directory: /tmp,
+# /private/tmp, /var/tmp, /private/var/tmp, or the resolved $TMPDIR (macOS's
+# per-user/per-process temp dir, e.g. /var/folders/.../T/). A checkout there
+# gets purged by the OS, leaving `whosaid install`'s symlink dangling with no
+# diagnostic pointing at the real cause — see `cmd_install`, `cmd_doctor`, and
+# GitHub issue #10.
+is_temp_path() {
+  local target="$1"
+  local resolved
+  resolved="$(cd -P "$target" 2>/dev/null && pwd)" || resolved="$target"
+  local roots=(/tmp /private/tmp /var/tmp /private/var/tmp)
+  if [[ -n "${TMPDIR:-}" ]]; then
+    local resolved_tmpdir
+    resolved_tmpdir="$(cd -P "$TMPDIR" 2>/dev/null && pwd)" || resolved_tmpdir="${TMPDIR%/}"
+    roots+=("$resolved_tmpdir")
+  fi
+  local root
+  for root in "${roots[@]}"; do
+    root="${root%/}"
+    [[ -z "$root" ]] && continue
+    if [[ "$resolved" == "$root" || "$resolved" == "$root"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ---- shared environment guards (mirrors the transcribe flow's own checks) --
+warn_if_not_arm64() {
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    log "WARNING — MLX is Apple-Silicon only; on $(uname -m) this will be slow or fail."
+  fi
+}
+
+ensure_uv_and_ffmpeg() {
+  if ! command -v uv >/dev/null 2>&1; then
+    log "'uv' not found. Installing via Homebrew..."
+    command -v brew >/dev/null 2>&1 || { log "Homebrew required to bootstrap uv. See https://brew.sh"; exit 1; }
+    brew install uv
+  fi
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    log "'ffmpeg' not found (needed to decode/capture audio). Installing via Homebrew..."
+    command -v brew >/dev/null 2>&1 || { log "Homebrew required to bootstrap ffmpeg. See https://brew.sh"; exit 1; }
+    brew install ffmpeg
+  fi
+}
+
+# ---- help --------------------------------------------------------------------
+cmd_help() {
+  cat <<'EOF'
+whosaid — local, GPU-accelerated, speaker-attributed transcription (Apple Silicon)
+
+USAGE
+  whosaid setup                        Install dependencies, pre-download models.
+  whosaid install [--force]            Install/update ~/.local/bin/whosaid. Refuses (unless
+                                        --force) when this checkout is under a temp directory,
+                                        since the symlink would dangle once it's cleaned up.
+  whosaid enroll [Name] [--from FILE [--ss T] [--t D|--to T]] [--force]
+                                        Record (or extract from an existing FILE) a voice
+                                        sample and name a speaker cluster.
+  whosaid record [--label L] [flags]   Record from the mic, then transcribe it.
+  whosaid doctor                       Read-only environment/model/device report.
+  whosaid version | --version | -V     Print the installed version.
+  whosaid mcp                          Run the MCP server (stdio) for AI agents / Claude.
+  whosaid <audio> [<audio> ...] [flags]
+                                        Transcribe (and by default diarize) file(s).
+  whosaid relabel <base> SPEAKER_02=Jane [SPEAKER_03=Bob ...] [-o DIR]
+  whosaid relabel <base> --auto [--absorb-threshold F] [-o DIR]
+                                        Name clusters from the speaker cards and
+                                        remember them for future transcripts; --auto
+                                        re-applies registry + absorb naming over the
+                                        cached sidecar with no re-transcription.
+  whosaid samples <base> [-o DIR] [--audio FILE] [--per-speaker N]
+                  [--seconds S] [--json]
+                                        Export one short representative WAV per
+                                        speaker cluster, cut from the original
+                                        recording, so you can listen and confirm
+                                        an identity before trusting an auto-label
+                                        or enrolling.
+  whosaid ingest <audio> [<audio> ...] --into DIR [--folder-by created|mtime]
+                                        [--tz ZONE] [--action-items] [--hook CMD]
+                                        [flags]
+                                        Transcribe each file into its own dated
+                                        meeting folder (idempotent by content
+                                        hash; skips anything already ingested).
+  whosaid roll-up <dir> [--action-items] [--similarity-threshold F] [--rebuild]
+                                        Rebuild the workspace index, audit, and
+                                        action-item corpus.
+  whosaid help | -h | --help           This message.
+
+TRANSCRIBE FLAGS
+  -o, --outdir DIR    Output directory (default: alongside each input file).
+  -m, --model REPO    HuggingFace mlx-community Whisper repo (default: turbo).
+      --accurate       Shorthand for mlx-community/whisper-large-v3-mlx (full
+                       large-v3; slower, best fidelity on names/numbers).
+  -l, --lang CODE     Language code (default: en; use "auto" to auto-detect).
+  -f, --format FMT    txt | srt | vtt | tsv | json | all (default: all).
+  -n, --name NAME     Output base name (single input only; default: input basename).
+      --speakers N     Exact speaker count for diarization (e.g. 2 for a 1:1 call;
+                       omit to auto-detect the number of speakers).
+      --min-speakers N  Lower bound on the auto-detected speaker count.
+      --max-speakers N  Upper bound on the auto-detected speaker count (also lowers
+                       the hard cap of 20). Use a range when you know roughly how
+                       many people were in the room but not exactly; an estimate
+                       that lands on the bound is reported as unreliable.
+      --expected-speakers NAMES  Comma-separated roster of people you expect in this
+                       recording (repeatable), e.g. --expected-speakers Alice,Bob.
+                       Every name must already be a known voice (an enrolled clip or
+                       a registry entry). Turns matching one of those voiceprints are
+                       pinned to that person; everyone else is clustered normally, and
+                       a listed person who never speaks is simply dropped — so a
+                       varying-attendance team needs no exact --speakers count.
+      --anchor-threshold F  Cosine ≥ F is required before --expected-speakers pins a
+                       turn to a known voice. Default 0.70 (WHOSAID_ANCHOR_THRESHOLD).
+  -j, --jobs N         Parallel diarization workers for long audio (default: auto).
+      --chunk-seconds S Window length for parallel diarization (default: auto).
+      --no-chunk       Diarize the whole file in one pass (disable parallel chunking).
+      --absorb-threshold F  Cosine ≥ F folds a still-unnamed cluster into a known
+                       voice (registry/enrolled), so a person split across clusters
+                       merges into one speaker. Default 0.85 (WHOSAID_ABSORB_THRESHOLD).
+      --match-threshold F  Cosine ≥ F is required before a registry/enrolled voice
+                       may claim a cluster (alias --ref-threshold). A cluster whose
+                       best candidate scores below F keeps its anonymous SPEAKER_NN
+                       label. Default 0.50 (WHOSAID_MATCH_THRESHOLD); raise it if
+                       you see wrong names, lower it to catch more.
+      --no-diarize     Skip speaker diarization.
+      --diarize        Force diarization on (default already on).
+  -h, --help          This message.
+
+  Diarization auto-detects the speaker count, writes <base>.speaker-cards.txt with
+  a few representative snippets per speaker (so you can tell who each one is), and
+  auto-names anyone already in your local speaker registry. Name the rest with
+  'whosaid relabel'. Long recordings (>15 min) are diarized in parallel windows and
+  stitched back into consistent speakers automatically — much faster, same result.
+
+RELABEL FLAGS
+  <base>              Sidecar path or base name of a prior transcribe (the folder
+                      holds <base>.diarization.json). In a meeting workspace the
+                      base is "transcript".
+  SPEAKER_XX=Name     Assign a name to a cluster and remember its voiceprint.
+  --auto              No assignments needed: re-run registry matching + the absorb
+                      pass over the cached voiceprints and rewrite <base>.speakers.txt
+                      and <base>.speaker-cards.txt. Picks up voices enrolled after
+                      the transcript was made — no re-diarization.
+  --absorb-threshold F  Absorb-pass cosine threshold for --auto (default 0.85).
+  --match-threshold F  Registry/ref match cosine threshold for --auto (alias
+                      --ref-threshold; default 0.50). Clusters under it stay SPEAKER_NN.
+  -o, --outdir DIR    Where the sidecar/outputs live (default: alongside <base>).
+
+SAMPLES FLAGS
+  <base>              Sidecar path or base name of a prior transcribe — same
+                      resolution as relabel's <base>.
+  -o, --outdir DIR    Output ROOT (default: alongside <base>'s sidecar); clips
+                      land in <outdir>/<base>.samples/.
+  --audio FILE        Source recording to cut clips from, overriding the
+                      sidecar's own "source.path" — required for a sidecar
+                      written before source metadata existed (GitHub issue #1
+                      parts 2-3).
+  --per-speaker N     Clips per cluster, longest segment(s) first (default: 1).
+  --seconds S         Max clip length in seconds; a shorter segment exports at
+                      its own length (default: 8).
+  --json              Also print a final {"samples": [...]} JSON line
+                      (default: TSV only — SPEAKER_NN, name, start, duration,
+                      path, one line per file).
+
+RECORD FLAGS
+  --label L           Suffix the recording filename with -L.
+  Any transcribe flag above is also accepted and passed through after recording.
+
+ENROLL FLAGS
+  --from FILE         Extract the reference clip from an existing recording instead of
+                      recording from the mic (extract -> verify -> save, no interaction).
+  --ss T              Start offset into FILE (seconds, e.g. 200 or 12.5; or M:SS / H:MM:SS,
+                      e.g. 3:20). Default: start of file. Requires --from.
+  --t D               Clip duration (same time formats as --ss). Mutually exclusive with
+                      --to. Requires --from.
+  --to T              Clip end time (same time formats as --ss); converted to a duration
+                      internally. Mutually exclusive with --t. Requires --from.
+  --force             Overwrite an existing voices/<Name>.wav (default: refuse). Only
+                      meaningful with --from.
+  The extracted (or recorded) clip must still clear the same bar as mic enrollment: at
+  least 15s long and not silent (mean volume > -85 dB).
+
+INGEST FLAGS
+  --into DIR          Meeting workspace root (required; created if missing).
+  --folder-by WHEN    Timestamp source for the dated folder: created (container
+                      creation_time; default) or mtime (file modification time).
+  --tz ZONE           IANA zone for the dated folder name (default: system local
+                      zone via /etc/localtime, else UTC).
+  --action-items      Also extract action items for each ingested meeting.
+  --hook CMD          Action-items hook for this run (default: $WHOSAID_ACTION_ITEMS_HOOK).
+  Any transcribe flag above (except -o/--outdir and -n/--name, which ingest
+  controls) is accepted and passed through to the transcriber.
+
+ROLL-UP FLAGS
+  --action-items      Fold each meeting's action-items.md into the deduplicated
+                      corpus (_ACTION-ITEMS.md). Hand edits there (status, type,
+                      retitle, "(merged AI-NNN)") survive re-runs.
+  -o, --out FILE      Index markdown path (default: <workspace>/_INDEX.md).
+  --action-items-out FILE
+                      Corpus markdown path (default: <workspace>/_ACTION-ITEMS.md).
+  --similarity-threshold F
+                      Dedupe similarity threshold, 0.5–1.0 (default: 0.82).
+                      Pairs within 0.10 below it are listed for review.
+  --rebuild           Reset manifest + corpus, rebuild from folders on disk.
+
+ENV OVERRIDES
+  WHOSAID_MODEL        Default Whisper model repo.
+  WHOSAID_LANG         Default language code.
+  WHOSAID_VOICE_REFS   Directory of enrollment clips (default: ./voices).
+  WHOSAID_SPEAKER_DB   Local speaker registry (default: ~/.config/whosaid/speakers.json).
+  WHOSAID_ABSORB_THRESHOLD  Absorb-pass cosine threshold (default: 0.85); a still-
+                      unnamed cluster this close to a known voice is folded into it.
+  WHOSAID_MATCH_THRESHOLD  Registry/reference match cosine threshold (default: 0.50);
+                      a cluster whose best candidate scores below it stays SPEAKER_NN.
+  DIARIZE_EMB_NAME     Speaker-embedding model (default: NeMo TitaNet-small,
+                       English-native; set the zh-cn model for Mandarin audio).
+  WHOSAID_REC_DEVICE   avfoundation audio device index (default: 0).
+  WHOSAID_INSTALL_DIR  Command install directory (default: ~/.local/bin).
+  WHOSAID_ACTION_ITEMS_HOOK  Default action-items summarizer hook: gets the
+                      transcript on stdin, prints markdown on stdout.
+  HF_HOME               Hugging Face cache location (Whisper model cache).
+  SHERPA_DIARIZE_CACHE  sherpa-onnx diarization model cache location.
+
+Diarization writes <base>.rttm and merges with the Whisper output into
+<base>.speakers.txt (the speaker-labeled transcript). Diarization failure never
+loses the plain transcript — it warns and the transcript stands on its own.
+
+Nothing — audio, text, or embeddings — ever leaves the machine.
+EOF
+}
+
+# ---- version -----------------------------------------------------------------
+cmd_version() {
+  local git_suffix=""
+  if command -v git >/dev/null 2>&1; then
+    local described=""
+    described="$(git -C "$REPO_DIR" describe --tags --always --dirty 2>/dev/null || true)"
+    [[ -n "$described" ]] && git_suffix=" (git $described)"
+  fi
+  echo "whosaid ${WHOSAID_VERSION}${git_suffix}"
+}
+
+# ---- install -----------------------------------------------------------------
+# whosaid install [--force] [--check-only]
+#   --force        Install even if this checkout is under a temp directory.
+#   --check-only   INTERNAL (not documented in --help): run only the
+#                  temp-directory guard and exit 0/1 without touching the
+#                  filesystem. Used by bootstrap.sh to fail fast, before its
+#                  multi-minute model downloads, using the same is_temp_path
+#                  definition as the real install.
+cmd_install() {
+  local force=0 check_only=0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      --check-only) check_only=1 ;;
+      -h|--help) cmd_help; exit 0 ;;
+      *) log "install: unknown option: $arg"; exit 1 ;;
+    esac
+  done
+
+  local install_dir="${WHOSAID_INSTALL_DIR:-$HOME/.local/bin}"
+  local destination="$install_dir/whosaid"
+  local source="$REPO_DIR/whosaid"
+
+  if is_temp_path "$REPO_DIR"; then
+    if [[ "$force" -eq 0 ]]; then
+      log "FATAL this checkout lives in a temporary directory:"
+      log "FATAL   $REPO_DIR"
+      log "FATAL installing from here would create a symlink at $destination that dangles"
+      log "FATAL as soon as the OS cleans up this temp directory — the usual symptom is a"
+      log "FATAL plain 'command not found' later, with nothing pointing at the real cause."
+      log "FATAL move or clone this checkout to a stable location (e.g. ~/code/whosaid) and"
+      log "FATAL re-run 'whosaid install' there, or pass --force to install anyway."
+      exit 1
+    fi
+    log "WARNING installing from a temp-directory checkout ($REPO_DIR) — continuing because --force was given."
+    log "WARNING the installed symlink at $destination will dangle once this temp directory is cleaned up."
+  fi
+
+  if [[ "$check_only" -eq 1 ]]; then
+    exit 0
+  fi
+
+  mkdir -p "$install_dir"
+  if [[ -L "$destination" ]]; then
+    local existing=""
+    existing="$(readlink "$destination" 2>/dev/null || true)"
+    if [[ "$existing" == "$source" ]]; then
+      log "✓ command already installed at $destination"
+    else
+      ln -sfn "$source" "$destination"
+      log "✓ updated command symlink at $destination"
+    fi
+  elif [[ -e "$destination" ]]; then
+    log "FATAL refusing to replace existing non-symlink command at $destination"
+    log "remove or relocate it explicitly, then run 'whosaid install' again"
+    exit 1
+  else
+    ln -s "$source" "$destination"
+    log "✓ installed command at $destination"
+  fi
+
+  case ":${PATH:-}:" in
+    *":$install_dir:"*) ;;
+    *)
+      log "NOTE add $install_dir to PATH to run 'whosaid' by name"
+      ;;
+  esac
+}
+
+# ---- doctor --------------------------------------------------------------------
+cmd_doctor() {
+  echo "whosaid doctor"
+  echo "=============="
+
+  local arch os_ver
+  arch="$(uname -m)"
+  os_ver="$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+  if [[ "$arch" == "arm64" ]]; then
+    echo "✓ architecture: $arch (Apple Silicon) — macOS $os_ver"
+  else
+    echo "✗ architecture: $arch — whosaid requires Apple Silicon (arm64) for MLX/Metal"
+  fi
+
+  if command -v brew >/dev/null 2>&1; then
+    echo "✓ Homebrew: $(brew --version 2>/dev/null | head -1)"
+  else
+    echo "✗ Homebrew not found — fix: install from https://brew.sh"
+  fi
+
+  if command -v ffmpeg >/dev/null 2>&1; then
+    echo "✓ ffmpeg: $(ffmpeg -version 2>/dev/null | head -1)"
+  else
+    echo "✗ ffmpeg not found — fix: brew install ffmpeg"
+  fi
+
+  if command -v uv >/dev/null 2>&1; then
+    echo "✓ uv: $(uv --version 2>/dev/null)"
+  else
+    echo "✗ uv not found — fix: brew install uv"
+  fi
+
+  # Note: this check runs from whichever `whosaid` was invoked. If your
+  # installed ~/.local/bin/whosaid symlink is itself dangling, `whosaid doctor`
+  # by name won't run at all — that's exactly the "command not found" case in
+  # GitHub issue #10. Run `./whosaid doctor` from a fresh clone instead.
+  local install_dir="${WHOSAID_INSTALL_DIR:-$HOME/.local/bin}"
+  local destination="$install_dir/whosaid"
+  if [[ -L "$destination" ]]; then
+    local install_target=""
+    install_target="$(readlink "$destination" 2>/dev/null || true)"
+    if [[ ! -e "$destination" ]]; then
+      echo "✗ install: $destination -> $install_target is DANGLING (the checkout it pointed at no longer exists — was it in a temporary directory?) — fix: clone/move whosaid to a stable path and run 'whosaid install'"
+    elif [[ "$install_target" == "$REPO_DIR/whosaid" ]]; then
+      echo "✓ install: $destination -> $REPO_DIR/whosaid"
+    else
+      echo "  install: $destination -> $install_target (a different checkout than $REPO_DIR)"
+    fi
+  elif [[ -e "$destination" ]]; then
+    echo "  install: $destination exists but is not a symlink — fix: remove it, then run 'whosaid install'"
+  else
+    echo "  install: no $destination yet — fix: whosaid install"
+  fi
+  if is_temp_path "$REPO_DIR"; then
+    echo "✗ checkout lives in a temp directory ($REPO_DIR) — move it to a stable location"
+  fi
+
+  local hf_home
+  hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
+  if ls -d "$hf_home"/hub/models--mlx-community--whisper-large-v3-turbo* >/dev/null 2>&1; then
+    echo "✓ Whisper model cached (turbo) under $hf_home/hub"
+  else
+    echo "✗ Whisper model not cached — fix: ./whosaid setup"
+  fi
+
+  local sherpa_cache
+  sherpa_cache="${SHERPA_DIARIZE_CACHE:-$HOME/.cache/sherpa-diarization}"
+  if [[ -f "$sherpa_cache/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" ]]; then
+    echo "✓ sherpa diarization models cached under $sherpa_cache"
+  else
+    echo "✗ sherpa diarization models not cached — fix: ./whosaid setup"
+  fi
+
+  local emb_name="${DIARIZE_EMB_NAME:-nemo_en_titanet_small.onnx}"
+  if [[ -f "$sherpa_cache/$emb_name" ]]; then
+    echo "✓ speaker-embedding model cached: $emb_name"
+  else
+    echo "✗ speaker-embedding model not cached ($emb_name) — fix: ./whosaid setup"
+  fi
+
+  local speaker_db="${WHOSAID_SPEAKER_DB:-$HOME/.config/whosaid/speakers.json}"
+  if [[ -f "$speaker_db" ]]; then
+    local nvoiceprints=""
+    if command -v python3 >/dev/null 2>&1; then
+      nvoiceprints="$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1])).get("speakers",[])))' "$speaker_db" 2>/dev/null || echo '?')"
+    else
+      nvoiceprints="$(grep -c '"name"' "$speaker_db" 2>/dev/null || echo '?')"
+    fi
+    echo "✓ speaker registry: $speaker_db ($nvoiceprints voiceprint(s))"
+  else
+    echo "  speaker registry: none yet — name speakers with 'whosaid relabel' (default: $speaker_db)"
+  fi
+
+  local voices_found=0
+  for f in "$VOICE_REFS"/*.wav; do
+    [[ -f "$f" ]] || continue
+    voices_found=$((voices_found + 1))
+    echo "  voice: $(basename "${f%.wav}")"
+  done
+  if [[ "$voices_found" -eq 0 ]]; then
+    echo "✗ no enrolled voices — fix: ./whosaid enroll"
+  else
+    echo "✓ $voices_found enrolled voice(s) in $VOICE_REFS"
+  fi
+
+  echo "--- avfoundation audio devices ---"
+  ffmpeg -f avfoundation -list_devices true -i "" 2>&1 | awk '/AVFoundation audio devices:/{show=1} show' || true
+}
+
+# ---- enroll --------------------------------------------------------------------
+RAINBOW_PASSAGE="When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. The rainbow is a division of white light into many beautiful colors. These take the shape of a long round arch, with its path high above, and its two ends apparently beyond the horizon. There is, according to legend, a boiling pot of gold at one end. People look, but no one ever finds it. When a man looks for something beyond his reach, his friends say he is looking for the pot of gold at the end of the rainbow."
+
+# Enrollment clips (mic or --from) must clear this floor.
+MIN_ENROLL_SECONDS=15
+
+# is_valid_time TIME — TIME is seconds ("200", "12.5") or M:SS / H:MM:SS
+# ("3:20", "1:02:03"). Validated with a bash regex BEFORE it ever reaches
+# ffmpeg (which accepts both forms itself, but we want a clear error here).
+is_valid_time() {
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && return 0
+  [[ "$1" =~ ^[0-9]{1,2}:[0-9]{1,2}(\.[0-9]+)?$ ]] && return 0
+  [[ "$1" =~ ^[0-9]{1,2}:[0-9]{1,2}:[0-9]{1,2}(\.[0-9]+)?$ ]] && return 0
+  return 1
+}
+
+# time_to_seconds TIME — converts a value already validated by is_valid_time
+# into plain seconds, for arithmetic (bash 3.2 has no float math, so awk).
+time_to_seconds() {
+  local t="$1"
+  if [[ "$t" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '%s' "$t"
+    return
+  fi
+  awk -F: -v t="$t" 'BEGIN{
+    n = split(t, a, ":");
+    if (n == 2) printf "%.3f", a[1]*60 + a[2];
+    else if (n == 3) printf "%.3f", a[1]*3600 + a[2]*60 + a[3];
+    else printf "0";
+  }'
+}
+
+# verify_enroll_clip FILE LABEL [SILENCE_HINT]
+# Shared duration + silence gate used by BOTH the mic capture path and the
+# --from extraction path, so the two can never drift apart. Exits 1 with a
+# clear message on failure (caller's EXIT trap handles temp-file cleanup).
+# LABEL is the noun used in messages ("recording" for mic keeps the original
+# wording byte-for-byte; anything else — e.g. "clip" — uses SILENCE_HINT for
+# the silence-specific follow-up instead of the mic-permission fix).
+verify_enroll_clip() {
+  local file="$1" label="$2" silence_hint="${3:-}"
+
+  local dur
+  dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$file" 2>/dev/null || echo 0)"
+  if ! awk -v d="$dur" -v m="$MIN_ENROLL_SECONDS" 'BEGIN{exit !((d+0) >= m)}'; then
+    if [[ "$label" == "recording" ]]; then
+      log "recording too short (${dur}s) — need at least ${MIN_ENROLL_SECONDS}s of speech. Try again and read the whole passage."
+    else
+      log "$label too short (${dur}s) — need at least ${MIN_ENROLL_SECONDS}s of speech."
+    fi
+    exit 1
+  fi
+
+  local ffout meandb
+  ffout="$(ffmpeg -hide_banner -i "$file" -af volumedetect -f null - 2>&1)" || true
+  meandb=""
+  if [[ "$ffout" =~ mean_volume:\ (-?[0-9.]+)\ dB ]]; then
+    meandb="${BASH_REMATCH[1]}"
+  fi
+  if [[ -n "$meandb" ]] && awk -v m="$meandb" 'BEGIN{exit !((m+0) <= -85)}'; then
+    log "$label is SILENT (mean volume ${meandb} dB)."
+    if [[ "$label" == "recording" ]]; then
+      log "macOS denies an unauthorized app's microphone by feeding it silent zeros — no error is raised."
+      log "Fix: System Settings -> Privacy & Security -> Microphone -> enable your terminal app, then re-run 'whosaid enroll'."
+    else
+      log "$silence_hint"
+    fi
+    exit 1
+  fi
+}
+
+# whosaid enroll [Name] [--from FILE [--ss T] [--t D | --to T]] [--force]
+cmd_enroll() {
+  warn_if_not_arm64
+  ensure_uv_and_ffmpeg
+
+  local name="" from="" ss="" t_dur="" to="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)  from="${2:-}"; shift 2 ;;
+      --ss)    ss="${2:-}"; shift 2 ;;
+      --t)     t_dur="${2:-}"; shift 2 ;;
+      --to)    to="${2:-}"; shift 2 ;;
+      --force) force=1; shift ;;
+      -h|--help) cmd_help; exit 0 ;;
+      -*)
+        log "enroll: unknown option: $1"
+        log "usage: whosaid enroll [Name] [--from FILE [--ss T] [--t D|--to T]] [--force]"
+        exit 1
+        ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        else
+          log "enroll: unexpected argument '$1'"
+          exit 1
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -n "$t_dur" && -n "$to" ]]; then
+    log "enroll: --t and --to are mutually exclusive — pass a duration or an end time, not both."
+    exit 1
+  fi
+  if [[ ( -n "$ss" || -n "$t_dur" || -n "$to" ) && -z "$from" ]]; then
+    log "enroll: --ss/--t/--to require --from FILE."
+    exit 1
+  fi
+
+  if [[ -z "$name" ]]; then
+    read -r -p "whosaid: name for this voice (e.g. Alice): " name
+  fi
+  if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    log "invalid name '$name' — use only letters, numbers, underscore, hyphen."
+    exit 1
+  fi
+
+  mkdir -p "$VOICE_REFS"
+  local dest="$VOICE_REFS/$name.wav"
+
+  # ---- from-file path: extract -> diarize-grade clip check -> move --------
+  if [[ -n "$from" ]]; then
+    if [[ ! -f "$from" ]]; then
+      log "enroll: file not found: $from"
+      exit 1
+    fi
+    if [[ -e "$dest" && "$force" -ne 1 ]]; then
+      log "enroll: '$dest' already exists — pass --force to overwrite."
+      exit 1
+    fi
+
+    local start="0"
+    if [[ -n "$ss" ]]; then
+      if ! is_valid_time "$ss"; then
+        log "enroll: invalid --ss '$ss' — use seconds (200, 12.5) or M:SS / H:MM:SS."
+        exit 1
+      fi
+      start="$ss"
+    fi
+
+    local extract_dur=""
+    if [[ -n "$t_dur" ]]; then
+      if ! is_valid_time "$t_dur"; then
+        log "enroll: invalid --t '$t_dur' — use seconds (200, 12.5) or M:SS / H:MM:SS."
+        exit 1
+      fi
+      extract_dur="$t_dur"
+    elif [[ -n "$to" ]]; then
+      if ! is_valid_time "$to"; then
+        log "enroll: invalid --to '$to' — use seconds (200, 12.5) or M:SS / H:MM:SS."
+        exit 1
+      fi
+      # ffmpeg's `-to` is relative to the seeked start with `-ss` before `-i`
+      # on some versions, not an absolute end time — so rather than pass
+      # `-ss START -to END` and depend on that semantics, compute the
+      # duration ourselves and pass `-t DURATION`, which is unambiguous.
+      local start_s to_s
+      start_s="$(time_to_seconds "$start")"
+      to_s="$(time_to_seconds "$to")"
+      extract_dur="$(awk -v a="$start_s" -v b="$to_s" 'BEGIN{printf "%.3f", (b - a)}')"
+      if awk -v d="$extract_dur" 'BEGIN{exit !((d+0) <= 0)}'; then
+        log "enroll: --to ($to) must be after --ss ($start)."
+        exit 1
+      fi
+    fi
+
+    local tmpdir tmp
+    tmpdir="$(mktemp -d -t whosaid-enroll)"
+    tmp="$tmpdir/clip.wav"
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    if [[ -n "$extract_dur" ]]; then
+      ffmpeg -hide_banner -loglevel warning -y -ss "$start" -i "$from" -t "$extract_dur" -ac 1 -ar 16000 "$tmp" \
+        || { log "enroll: ffmpeg extraction failed."; exit 1; }
+    else
+      ffmpeg -hide_banner -loglevel warning -y -ss "$start" -i "$from" -ac 1 -ar 16000 "$tmp" \
+        || { log "enroll: ffmpeg extraction failed."; exit 1; }
+    fi
+
+    if [[ ! -s "$tmp" ]]; then
+      log "enroll: extraction produced no audio — check --ss/--t/--to fall within '$from'."
+      exit 1
+    fi
+
+    verify_enroll_clip "$tmp" "clip" \
+      "check --ss/--t/--to select a segment where the person is actually speaking, and that '$from' is the right file."
+
+    mv "$tmp" "$dest"
+    rm -rf "$tmpdir"
+    trap - EXIT
+    log "✓ enrolled '$name' -> $dest"
+    log "future transcripts will label this voice '$name'."
+    return
+  fi
+
+  # ---- mic recording path (unchanged) --------------------------------------
+  echo "============================================================================" >&2
+  echo "$RAINBOW_PASSAGE" | fold -s -w 76 >&2
+  echo "============================================================================" >&2
+  echo "Press Enter to start recording; read the passage aloud at a normal pace." >&2
+  echo "Recording stops automatically after 45s — or press Ctrl-C once you finish the paragraph." >&2
+  read -r _ || true
+
+  local tmpdir tmp
+  tmpdir="$(mktemp -d -t whosaid-enroll)"
+  tmp="$tmpdir/capture.m4a"
+  trap 'rm -rf "$tmpdir"' EXIT
+
+  log "recording... (up to 45s)"
+  # Ctrl-C must stop ffmpeg (which finalizes the file) WITHOUT killing this
+  # script — a no-op INT trap keeps bash alive so verification still runs.
+  set +e
+  trap ':' INT
+  ffmpeg -hide_banner -loglevel warning -f avfoundation -i ":$REC_DEVICE" \
+    -ac 1 -c:a aac -b:a 96k -t 45 -y "$tmp" </dev/null
+  rc=$?
+  trap - INT
+  set -e
+  if [[ "$rc" -ne 0 && "$rc" -ne 255 ]]; then
+    log "ffmpeg exited with an unexpected error (code $rc)."
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    log "recording failed — no audio was captured (ffmpeg exit $rc)."
+    exit 1
+  fi
+
+  verify_enroll_clip "$tmp" "recording"
+
+  ffmpeg -hide_banner -loglevel warning -y -i "$tmp" -ac 1 -ar 16000 "$dest"
+  rm -rf "$tmpdir"
+  trap - EXIT
+
+  log "✓ enrolled '$name' -> $dest"
+  log "future transcripts will label this voice '$name'."
+}
+
+# ---- record --------------------------------------------------------------------
+cmd_record() {
+  warn_if_not_arm64
+  ensure_uv_and_ffmpeg
+
+  local label=""
+  local extra_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --label) label="$2"; shift 2 ;;
+      *) extra_args+=("$1"); shift ;;
+    esac
+  done
+
+  mkdir -p "$RECORDINGS_DIR"
+  local ts out
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ -n "$label" ]]; then
+    local slug
+    slug="$(printf '%s' "$label" | tr -c 'A-Za-z0-9_-' '-')"
+    out="$RECORDINGS_DIR/${ts}-${slug}.m4a"
+  else
+    out="$RECORDINGS_DIR/${ts}.m4a"
+  fi
+
+  log "recording to $out — press Ctrl-C to stop (auto-stops after 3h)."
+  # Ctrl-C must stop ffmpeg (which finalizes the m4a) WITHOUT killing this
+  # script — a no-op INT trap keeps bash alive so verify + transcribe still run.
+  set +e
+  trap ':' INT
+  ffmpeg -hide_banner -loglevel warning -f avfoundation -i ":$REC_DEVICE" \
+    -ac 1 -c:a aac -b:a 96k -t 10800 -y "$out" </dev/null
+  rc=$?
+  trap - INT
+  set -e
+  if [[ "$rc" -ne 0 && "$rc" -ne 255 ]]; then
+    log "ffmpeg exited with an unexpected error (code $rc)."
+  fi
+
+  if [[ ! -s "$out" ]]; then
+    log "recording failed — no audio was captured (ffmpeg exit $rc)."
+    exit 1
+  fi
+
+  local dur
+  dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" 2>/dev/null || echo "?")"
+  log "captured ${dur}s -> $out"
+
+  local ffout meandb
+  ffout="$(ffmpeg -hide_banner -i "$out" -af volumedetect -f null - 2>&1)" || true
+  meandb=""
+  if [[ "$ffout" =~ mean_volume:\ (-?[0-9.]+)\ dB ]]; then
+    meandb="${BASH_REMATCH[1]}"
+  fi
+  if [[ -n "$meandb" ]] && awk -v m="$meandb" 'BEGIN{exit !((m+0) <= -85)}'; then
+    log "recording saved at $out but it is SILENT (mean volume ${meandb} dB)."
+    log "macOS denies an unauthorized app's microphone by feeding it silent zeros — no error is raised."
+    log "Fix: System Settings -> Privacy & Security -> Microphone -> enable your terminal app, then re-run."
+    exit 4
+  fi
+
+  # ${arr[@]+...} guard: expanding an EMPTY array errs under set -u on bash 3.2
+  # (macOS system bash), which would crash a plain `whosaid record`.
+  cmd_transcribe "$out" ${extra_args[@]+"${extra_args[@]}"}
+}
+
+# ---- transcribe (default flow) --------------------------------------------------
+cmd_transcribe() {
+  [[ -f "$HELPER" ]] || { log "helper not found at $HELPER"; exit 1; }
+
+  local MODEL="${WHOSAID_MODEL:-mlx-community/whisper-large-v3-turbo}"
+  local LANG_CODE="$LANG_CODE_DEFAULT"
+  local FORMAT="all"
+  local OUTDIR=""
+  local NAME=""
+  local DIARIZE=1
+  local SPEAKERS=""
+  local JOBS=""
+  local CHUNK_SECONDS=""
+  local NO_CHUNK=0
+  local ABSORB=""
+  local MATCH_THRESHOLD=""
+  local MIN_SPEAKERS=""
+  local MAX_SPEAKERS=""
+  local EXPECTED_SPEAKERS=()
+  local ANCHOR_THRESHOLD=""
+  local AUDIO=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--outdir)  OUTDIR="$2"; shift 2 ;;
+      -m|--model)   MODEL="$2"; shift 2 ;;
+      --accurate)   MODEL="mlx-community/whisper-large-v3-mlx"; shift ;;
+      -l|--lang)    LANG_CODE="$2"; shift 2 ;;
+      -f|--format)  FORMAT="$2"; shift 2 ;;
+      -n|--name)    NAME="$2"; shift 2 ;;
+      --no-diarize) DIARIZE=0; shift ;;
+      --diarize)    DIARIZE=1; shift ;;
+      --speakers)   SPEAKERS="$2"; shift 2 ;;
+      --min-speakers) MIN_SPEAKERS="$2"; shift 2 ;;
+      --max-speakers) MAX_SPEAKERS="$2"; shift 2 ;;
+      --expected-speakers) EXPECTED_SPEAKERS+=("$2"); shift 2 ;;
+      --anchor-threshold) ANCHOR_THRESHOLD="$2"; shift 2 ;;
+      -j|--jobs)    JOBS="$2"; shift 2 ;;
+      --chunk-seconds) CHUNK_SECONDS="$2"; shift 2 ;;
+      --absorb-threshold) ABSORB="$2"; shift 2 ;;
+      --match-threshold|--ref-threshold) MATCH_THRESHOLD="$2"; shift 2 ;;
+      --no-chunk)   NO_CHUNK=1; shift ;;
+      -h|--help)    cmd_help; exit 0 ;;
+      --version|-V) cmd_version; exit 0 ;;
+      --)           shift; while [[ $# -gt 0 ]]; do AUDIO+=("$1"); shift; done ;;
+      -*)           log "unknown option: $1"; cmd_help; exit 1 ;;
+      *)            AUDIO+=("$1"); shift ;;
+    esac
+  done
+
+  [[ ${#AUDIO[@]} -eq 0 ]] && { log "no audio file given."; cmd_help; exit 1; }
+  [[ -n "$NAME" && ${#AUDIO[@]} -gt 1 ]] && { log "--name only works with a single input."; exit 1; }
+
+  warn_if_not_arm64
+  ensure_uv_and_ffmpeg
+
+  log "model=$MODEL  lang=$LANG_CODE  format=$FORMAT  diarize=$DIARIZE  (GPU/Metal via MLX)"
+  SECONDS=0
+  for audio in "${AUDIO[@]}"; do
+    [[ -f "$audio" ]] || { log "file not found: $audio"; exit 1; }
+    local out="${OUTDIR:-$(dirname "$audio")}"
+    mkdir -p "$out"
+    local dur
+    dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$audio" 2>/dev/null || echo "?")"
+    log "→ $audio  (${dur}s)  →  $out/"
+
+    # Derive a dot-safe output base. mlx-whisper's writer runs its own
+    # os.path.splitext on the base, so any '.' in the name (e.g. "v1.2") would
+    # truncate every output file. Map anything but [A-Za-z0-9_-] to '_' and pass
+    # this base explicitly so the CLI and both helpers agree on the filenames.
+    local base="${NAME:-$(basename "${audio%.*}")}"
+    base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9_-' '_')"
+
+    local helper_args=("$audio" --model "$MODEL" --outdir "$out" --lang "$LANG_CODE" --format "$FORMAT" --name "$base")
+
+    uv run --quiet --with mlx-whisper python "$HELPER" "${helper_args[@]}"
+
+    local txt="$out/$base.txt"
+    if [[ ! -s "$txt" ]]; then
+      log "ERROR expected transcript not found or empty: $txt"
+      exit 1
+    fi
+    log "✓ $txt"
+    echo "----- first lines -----" >&2
+    head -c 600 "$txt" >&2; echo >&2
+
+    # --- speaker diarization (local; never fatal to the transcript) -------------
+    # Only the .json output feeds the diarizer merge, so this whole block — and the
+    # exit-3 gate below — only applies when --format actually produced one.
+    if [[ "$DIARIZE" == "1" && -f "$out/$base.json" ]]; then
+      if [[ -f "$DIARIZER" ]]; then
+        local dargs=("$audio" --whisper-json "$out/$base.json" --outdir "$out" --name "$base")
+        [[ -n "$SPEAKERS" ]] && dargs+=(--num-speakers "$SPEAKERS")
+        [[ -n "$MIN_SPEAKERS" ]] && dargs+=(--min-speakers "$MIN_SPEAKERS")
+        [[ -n "$MAX_SPEAKERS" ]] && dargs+=(--max-speakers "$MAX_SPEAKERS")
+        # bash 3.2 + `set -u`: expanding an EMPTY array is an unbound-variable error,
+        # so the count guard is required, not cosmetic.
+        if [[ ${#EXPECTED_SPEAKERS[@]} -gt 0 ]]; then
+          local exp=""
+          for exp in "${EXPECTED_SPEAKERS[@]}"; do dargs+=(--expected-speakers "$exp"); done
+        fi
+        [[ -n "$ANCHOR_THRESHOLD" ]] && dargs+=(--anchor-threshold "$ANCHOR_THRESHOLD")
+        [[ -n "$JOBS" ]] && dargs+=(--jobs "$JOBS")
+        [[ -n "$CHUNK_SECONDS" ]] && dargs+=(--chunk-seconds "$CHUNK_SECONDS")
+        [[ "$NO_CHUNK" == "1" ]] && dargs+=(--no-chunk)
+        [[ -n "$ABSORB" ]] && dargs+=(--absorb-threshold "$ABSORB")
+        [[ -n "$MATCH_THRESHOLD" ]] && dargs+=(--ref-threshold "$MATCH_THRESHOLD")
+        if [[ -d "$VOICE_REFS" ]]; then
+          for ref in "$VOICE_REFS"/*.wav "$VOICE_REFS"/*.m4a; do
+            [[ -f "$ref" ]] || continue
+            local refname
+            refname="$(basename "${ref%.*}")"
+            dargs+=(--ref "$refname=$ref")
+          done
+        fi
+        if uv run --quiet --with sherpa-onnx --with numpy python "$DIARIZER" "${dargs[@]}"; then
+          :
+        else
+          log "WARN diarization failed; plain transcript is unaffected."
+        fi
+      else
+        log "WARN diarizer script not found at $DIARIZER; skipping diarization for $audio."
+      fi
+
+      local speakers_txt="$out/$base.speakers.txt"
+      if [[ ! -s "$speakers_txt" ]]; then
+        log "plain transcript saved at $txt; diarization failed (see warnings above)"
+        exit 3
+      fi
+      log "✓ $speakers_txt (speaker-labeled)"
+    elif [[ "$DIARIZE" == "1" ]]; then
+      log "WARN Whisper json output not found (format=$FORMAT); skipping diarization for $audio."
+    fi
+  done
+  log "done in ${SECONDS}s."
+}
+
+# ---- sidecar resolution (shared by relabel + samples) -------------------------
+# resolve_sidecar TARGET OUTDIR CALLER_LABEL
+# Resolves TARGET (a sidecar path or a <base> name) to its <base>.diarization.json
+# sidecar: TARGET itself as a file, then TARGET.diarization.json in cwd, then
+# OUTDIR/TARGET.diarization.json. Sets RESOLVED_SIDECAR on success. Logs
+# "$CALLER_LABEL: could not find..." and exits 1 on failure. Call this directly
+# (never inside a subshell/command substitution) so that exit is real — bash's
+# `local x=$(...)` masks a command substitution's exit status from `set -e`.
+RESOLVED_SIDECAR=""
+resolve_sidecar() {
+  local target="$1" outdir="$2" label="$3"
+  if [[ -f "$target" ]]; then
+    RESOLVED_SIDECAR="$target"
+  elif [[ -f "$target.diarization.json" ]]; then
+    RESOLVED_SIDECAR="$target.diarization.json"
+  elif [[ -n "$outdir" && -f "$outdir/$target.diarization.json" ]]; then
+    RESOLVED_SIDECAR="$outdir/$target.diarization.json"
+  else
+    log "$label: could not find a diarization sidecar for '$target'"
+    log "  looked for: $target, ./$target.diarization.json${outdir:+, $outdir/$target.diarization.json}"
+    exit 1
+  fi
+}
+
+# ---- relabel -----------------------------------------------------------------
+# After reading the speaker cards, put real names on clusters and remember them.
+#   whosaid relabel <base|sidecar.diarization.json> SPEAKER_02=Jane SPEAKER_03=Bob [-o DIR]
+# Applies names to the cached diarization sidecar (no re-transcription), persists
+# each named voiceprint to the local registry (~/.config/whosaid/speakers.json by
+# default) so the person is auto-named in future transcripts, and rewrites the
+# speaker-labeled transcript + cards.
+cmd_relabel() {
+  local target="" outdir="" auto=0 specs=() extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--outdir) outdir="$2"; shift 2 ;;
+      --auto)      auto=1; shift ;;
+      --absorb-threshold) extra+=(--absorb-threshold "$2"); shift 2 ;;
+      --ref-threshold|--match-threshold) extra+=(--ref-threshold "$2"); shift 2 ;;
+      *=*)         specs+=(--save-speaker "$1"); shift ;;
+      *)           if [[ -z "$target" ]]; then target="$1"; else log "relabel: unexpected arg '$1'"; exit 1; fi; shift ;;
+    esac
+  done
+  [[ -z "$target" ]] && { log "relabel: need a base name or sidecar path. e.g. whosaid relabel meeting SPEAKER_02=Jane (or --auto)"; exit 1; }
+  if [[ ${#specs[@]} -eq 0 && "$auto" -eq 0 ]]; then
+    log "relabel: need at least one SPEAKER_XX=Name assignment, or --auto to re-apply registry + absorb naming"; exit 1
+  fi
+
+  resolve_sidecar "$target" "$outdir" relabel
+  local sidecar="$RESOLVED_SIDECAR"
+  local sdir; sdir="$(cd -P "$(dirname "$sidecar")" && pwd)"
+  log "relabel: using sidecar $sidecar"
+  [[ "$auto" -eq 1 ]] && extra+=(--auto)
+  uv run --quiet --with sherpa-onnx --with numpy python "$DIARIZER" \
+    --relabel "$sidecar" --outdir "$sdir" ${specs[@]+"${specs[@]}"} ${extra[@]+"${extra[@]}"}
+}
+
+# ---- samples ------------------------------------------------------------------
+# Per-speaker sample-clip export for human verification (GitHub issue #1):
+#   whosaid samples <base|sidecar.diarization.json> [-o DIR] [--audio FILE]
+#                    [--per-speaker N] [--seconds S] [--json]
+# Cuts one short representative WAV per SPEAKER_NN cluster from the ORIGINAL
+# recording, so you can listen and confirm an identity before trusting an
+# auto-label or enrolling — see the README's "Speaker identity" section for how
+# that differs from enrolling/relabeling. Resolves <base> to its sidecar the
+# same way `relabel` does; -o is also the output ROOT (default: alongside the
+# sidecar), under which <base>.samples/ is created. All picking/cutting logic
+# lives in lib/samples.py (stdlib-only; plain python3, no uv).
+cmd_samples() {
+  local target="" outdir="" audio="" per_speaker="" seconds="" want_json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--outdir)   outdir="$2"; shift 2 ;;
+      --audio)       audio="$2"; shift 2 ;;
+      --per-speaker) per_speaker="$2"; shift 2 ;;
+      --seconds)     seconds="$2"; shift 2 ;;
+      --json)        want_json=1; shift ;;
+      -h|--help)     cmd_help; exit 0 ;;
+      -*)            log "samples: unknown option: $1"; exit 1 ;;
+      *)             if [[ -z "$target" ]]; then target="$1"; else log "samples: unexpected arg '$1'"; exit 1; fi; shift ;;
+    esac
+  done
+  [[ -z "$target" ]] && { log "samples: need a base name or sidecar path. e.g. whosaid samples meeting"; exit 1; }
+
+  resolve_sidecar "$target" "$outdir" samples
+  local sidecar="$RESOLVED_SIDECAR"
+  log "samples: using sidecar $sidecar"
+
+  local pyargs=("$sidecar")
+  [[ -n "$outdir" ]] && pyargs+=(--outdir "$outdir")
+  [[ -n "$audio" ]] && pyargs+=(--audio "$audio")
+  [[ -n "$per_speaker" ]] && pyargs+=(--per-speaker "$per_speaker")
+  [[ -n "$seconds" ]] && pyargs+=(--seconds "$seconds")
+  [[ "$want_json" -eq 1 ]] && pyargs+=(--json)
+
+  python3 "$REPO_DIR/lib/samples.py" "${pyargs[@]}"
+}
+
+# ---- ingest / roll-up (issue #2: meeting workspace) ----------------------------
+# whosaid ingest <audio...> --into DIR [--folder-by created|mtime] [--tz ZONE]
+#                [--action-items] [--hook CMD] [transcribe flags...]
+# Transcribe each file into <into>/<YYYY-MM-DD-HHMM>/ with base name "transcript"
+# and keep the source audio beside it so roll-up's audit can hash it. Idempotent:
+# a file whose sha256 already appears in <into>/_workspace.json (written by
+# roll-up) is skipped BEFORE any transcription. Folder naming, hashing, and
+# action items live in lib/workspace.py (stdlib-only; plain python3 runs it).
+cmd_ingest() {
+  local into="" folder_by="created" tz_arg="" want_action_items=0 hook=""
+  local passthrough=() AUDIO=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --into)         into="$2"; shift 2 ;;
+      --folder-by)    folder_by="$2"; shift 2 ;;
+      --tz)           tz_arg="$2"; shift 2 ;;
+      --action-items) want_action_items=1; shift ;;
+      --hook)         hook="$2"; shift 2 ;;
+      # ingest owns the output layout and base name
+      -o|--outdir) log "ingest: -o/--outdir is not allowed — ingest places each meeting itself"; exit 1 ;;
+      -n|--name)   log "ingest: -n/--name is not allowed — ingest names its outputs 'transcript'"; exit 1 ;;
+      # transcribe flags that pass straight through
+      -m|--model|-l|--lang|-f|--format|--speakers|--min-speakers|--max-speakers|--expected-speakers|--anchor-threshold|-j|--jobs|--chunk-seconds|--absorb-threshold|--match-threshold|--ref-threshold)
+                      passthrough+=("$1" "$2"); shift 2 ;;
+      --accurate|--diarize|--no-diarize|--no-chunk)
+                      passthrough+=("$1"); shift ;;
+      --)            shift; while [[ $# -gt 0 ]]; do AUDIO+=("$1"); shift; done ;;
+      -h|--help)     cmd_help; exit 0 ;;
+      -*)            log "unknown option: $1"; cmd_help; exit 1 ;;
+      *)             AUDIO+=("$1"); shift ;;
+    esac
+  done
+
+  [[ -z "$into" ]] && { log "ingest: --into DIR is required (the meeting workspace root)"; exit 1; }
+  [[ ${#AUDIO[@]} -eq 0 ]] && { log "no audio file given."; cmd_help; exit 1; }
+  case "$folder_by" in
+    created|mtime) ;;
+    *) log "ingest: --folder-by must be 'created' or 'mtime' (got '$folder_by')"; exit 1 ;;
+  esac
+
+  mkdir -p "$into"
+
+  # Local zone for the dated folder name: explicit --tz wins, else the system's
+  # IANA zone from /etc/localtime; if neither resolves, leave --tz off and let
+  # workspace.py default to UTC.
+  local tz=""
+  if [[ -n "$tz_arg" ]]; then
+    tz="$tz_arg"
+  else
+    local localtime_link=""
+    localtime_link="$(readlink /etc/localtime 2>/dev/null || true)"
+    if [[ "$localtime_link" == *zoneinfo/* ]]; then
+      tz="${localtime_link##*zoneinfo/}"
+    else
+      log "NOTE could not detect the local timezone; folder names default to UTC (pass --tz ZONE to override)"
+    fi
+  fi
+  if [[ -n "$tz" ]]; then
+    python3 -c 'import sys; from zoneinfo import ZoneInfo; ZoneInfo(sys.argv[1])' "$tz" 2>/dev/null \
+      || { log "ingest: unknown timezone '$tz'"; exit 1; }
+  fi
+
+  local audio sha existing fname
+  for audio in "${AUDIO[@]}"; do
+    [[ -f "$audio" ]] || { log "file not found: $audio"; exit 1; }
+
+    # identity + idempotence: skip BEFORE any transcription work
+    sha="$(python3 "$REPO_DIR/lib/workspace.py" hash "$audio")" \
+      || { log "ingest: hash failed for $audio"; exit 1; }
+    existing="$(python3 -c '
+import json, sys
+sha, manifest = sys.argv[1], sys.argv[2]
+try:
+    meetings = json.load(open(manifest)).get("meetings", [])
+except Exception:
+    sys.exit(0)
+for m in meetings:
+    if isinstance(m, dict) and m.get("source_sha256") == sha:
+        print(m.get("folder", ""))
+        break
+' "$sha" "$into/_workspace.json")"
+    if [[ -n "$existing" ]]; then
+      log "already ingested as $existing (skipping) — $audio"
+      continue
+    fi
+
+    # dated folder name
+    if [[ "$folder_by" == "mtime" ]]; then
+      # workspace.py's folder-name always prefers the creation_time tag, so the
+      # mtime mode is computed here from the filesystem stamp directly.
+      local epoch date_tz="$tz"
+      [[ -z "$date_tz" ]] && date_tz="UTC"
+      epoch="$(stat -f %m "$audio")"
+      fname="$(TZ="$date_tz" date -r "$epoch" +%Y-%m-%d-%H%M)"
+    else
+      local fn_args=(folder-name "$audio")
+      if [[ -n "$tz" ]]; then fn_args+=(--tz "$tz"); fi
+      fname="$(python3 "$REPO_DIR/lib/workspace.py" "${fn_args[@]}")" \
+        || { log "ingest: could not derive a folder name for $audio"; exit 1; }
+    fi
+
+    # a same-named folder already holding another meeting gets -2, -3, ... suffixes
+    local base_fname="$fname" n=2
+    while [[ -d "$into/$fname" ]] && [[ -n "$(ls -A "$into/$fname")" ]]; do
+      fname="$base_fname-$n"
+      n=$((n + 1))
+    done
+    [[ "$fname" != "$base_fname" ]] && log "folder $base_fname already occupied; using $fname"
+
+    local folder="$into/$fname"
+    mkdir -p "$folder"
+    log "→ $audio  →  $folder/"
+
+    # WHOSAID_INGEST_DRYRUN (undocumented test hook): skip the model call but
+    # leave a stub transcript so the rest of the ingest plumbing can be checked.
+    if [[ -n "${WHOSAID_INGEST_DRYRUN:-}" ]]; then
+      log "(dryrun) transcription skipped; would run: transcribe $audio -o $folder -n transcript"
+      printf '[dryrun stub transcript]\n' > "$folder/transcript.txt"
+    else
+      # Subshell: cmd_transcribe signals "transcript ok, diarization failed"
+      # with exit 3 — that must warn here, not abort the ingest loop.
+      local rc=0
+      ( cmd_transcribe "$audio" -o "$folder" -n transcript ${passthrough[@]+"${passthrough[@]}"} ) || rc=$?
+      if [[ "$rc" -ne 0 ]]; then
+        if [[ "$rc" -eq 3 ]]; then
+          log "WARN diarization incomplete for $fname; plain transcript stands"
+        else
+          log "ERROR transcription failed (exit $rc): $audio"
+          exit "$rc"
+        fi
+      fi
+    fi
+
+    # keep the source beside the transcript so roll-up's audit can hash it
+    local copied=1
+    cp -n "$audio" "$folder/" || { copied=0; log "WARN source copy skipped for $fname"; }
+
+    # upsert a minimal manifest entry so ingest alone is idempotent: without it an
+    # immediate re-ingest (no roll-up in between) sees no sha in _workspace.json
+    # and duplicates the meeting into a -2 folder. roll-up's scan_meeting keeps
+    # ingested_at and recomputes every other field from the folder contents.
+    if [[ "$copied" == "1" ]]; then
+      python3 -c '
+import json, os, sys, tempfile
+from datetime import datetime, timezone
+
+path, folder, src, sha = sys.argv[1:5]
+try:
+    with open(path) as f:
+        data = json.load(f)
+    if not (isinstance(data, dict) and isinstance(data.get("meetings"), list)):
+        raise ValueError("unexpected manifest shape")
+except Exception:
+    data = {"meetings": []}
+data["meetings"] = [
+    m for m in data["meetings"]
+    if not (isinstance(m, dict) and m.get("folder") == folder)
+]
+data["meetings"].append({
+    "folder": folder,
+    "source_name": src,
+    "source_sha256": sha,
+    "ingested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+})
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".workspace-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+' "$into/_workspace.json" "$fname" "$(basename "$audio")" "$sha" \
+        || log "WARN could not update manifest; roll-up will rebuild it"
+    fi
+
+    if [[ "$want_action_items" == "1" ]]; then
+      local transcript="$folder/transcript.speakers.txt"
+      if [[ ! -s "$transcript" ]]; then
+        transcript="$folder/transcript.txt"
+        log "NOTE no speaker-labeled transcript in $fname; using the plain transcript for action items"
+      fi
+      if [[ -s "$transcript" ]]; then
+        local ai_args=(action-items --transcript "$transcript" --json-out "$folder/action-items.json")
+        if [[ -n "$hook" ]]; then ai_args+=(--hook "$hook"); fi
+        python3 "$REPO_DIR/lib/workspace.py" "${ai_args[@]}" \
+          || log "WARN action items failed for $fname (continuing)"
+      else
+        log "WARN no transcript found in $fname; skipping action items"
+      fi
+    fi
+    log "✓ ingested $fname/"
+  done
+
+  log "next: whosaid roll-up $into --action-items"
+}
+
+# whosaid roll-up <workspace-dir> [--action-items] [-o OUT] [--action-items-out OUT]
+#                 [--similarity-threshold F] [--rebuild]
+# Thin bash front for `python3 lib/workspace.py rollup`: rebuilds _INDEX.md, the
+# _workspace.json manifest, and (with --action-items) the deduplicated corpus.
+cmd_rollup() {
+  local wsdir="" py_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --action-items)     py_args+=("$1"); shift ;;
+      --rebuild)          py_args+=("$1"); shift ;;
+      -o|--out)           py_args+=("$1" "$2"); shift 2 ;;
+      --action-items-out) py_args+=("$1" "$2"); shift 2 ;;
+      --similarity-threshold) py_args+=("$1" "$2"); shift 2 ;;
+      -h|--help)          cmd_help; exit 0 ;;
+      -*)                 log "unknown option: $1"; cmd_help; exit 1 ;;
+      *)                  if [[ -z "$wsdir" ]]; then wsdir="$1"; else log "roll-up: unexpected arg '$1'"; exit 1; fi; shift ;;
+    esac
+  done
+  [[ -z "$wsdir" ]] && { log "roll-up: need a workspace directory. e.g. whosaid roll-up meetings/"; exit 1; }
+  exec python3 "$REPO_DIR/lib/workspace.py" rollup "$wsdir" ${py_args[@]+"${py_args[@]}"}
+}
+
+# ---- dispatch --------------------------------------------------------------------
+case "${1:-}" in
+  setup)
+    exec "$REPO_DIR/bootstrap.sh" "${@:2}"
+    ;;
+  install)
+    cmd_install "${@:2}"
+    ;;
+  enroll)
+    cmd_enroll "${@:2}"
+    ;;
+  record)
+    cmd_record "${@:2}"
+    ;;
+  relabel)
+    cmd_relabel "${@:2}"
+    ;;
+  samples)
+    cmd_samples "${@:2}"
+    ;;
+  ingest)
+    cmd_ingest "${@:2}"
+    ;;
+  roll-up|rollup)
+    cmd_rollup "${@:2}"
+    ;;
+  doctor)
+    cmd_doctor
+    ;;
+  version|--version|-V)
+    cmd_version
+    ;;
+  mcp)
+    # Pin to the tested SDK major: mcp 2.x uses MCPServer; a future 3.0 could
+    # break the API, so cap it rather than silently pull an untested major.
+    exec uv run --quiet --with "mcp[cli]>=2,<3" python "$REPO_DIR/lib/mcp_server.py"
+    ;;
+  help|-h|--help|"")
+    cmd_help
+    ;;
+  *)
+    cmd_transcribe "$@"
+    ;;
+esac
